@@ -28,3 +28,10 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+
+  locust:
+    build: ./loadtest
+    ports:
+      - "8089:8089"   # the Locust web dashboard
+    depends_on:
+      - api
