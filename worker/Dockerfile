@@ -5,6 +5,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY worker.py .
+COPY celery_app.py .
 
-CMD ["python", "worker.py"]
+# Run one Celery worker process with an embedded Beat scheduler (--beat),
+# so it both processes queued jobs and fires the periodic heartbeat.
+CMD ["celery", "-A", "celery_app", "worker", "--beat", "--loglevel=info"]

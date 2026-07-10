@@ -3,6 +3,8 @@ import time
 from pathlib import Path
 
 import redis
+from celery import Celery
+from celery.result import AsyncResult
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -14,6 +16,12 @@ redis_client = redis.Redis(
     port=int(os.getenv("REDIS_PORT", 6379)),
     decode_responses=True,
 )
+
+# Celery client on the API side. Same broker/backend URL as the worker, so
+# jobs the API enqueues land in the queue the worker is watching. The API
+# has NO task code — it enqueues and reads results purely by task name / id.
+_redis_url = f"redis://{os.getenv('REDIS_HOST', 'redis')}:{os.getenv('REDIS_PORT', '6379')}/0"
+celery_app = Celery("rate_limiter", broker=_redis_url, backend=_redis_url)
 
 WORKER_HEARTBEAT_KEY = "worker:heartbeat"
 WORKER_STALE_AFTER_SECONDS = 15
@@ -127,3 +135,27 @@ def update_item(item_id: str, body: ItemUpdate):
     FAKE_DB[item_id] = body.value
     redis_client.delete(f"item:{item_id}")  # invalidate: don't serve the old cached value
     return {"item_id": item_id, "value": body.value, "cache": "invalidated"}
+
+
+# --- Phase 3: background jobs via Celery ---
+
+class JobRequest(BaseModel):
+    seconds: int = 10  # how long the fake heavy job should "work"
+
+
+@app.post("/jobs")
+def create_job(body: JobRequest):
+    # Enqueue by task NAME (the API has no copy of the task code) and return
+    # instantly with a ticket id. The worker runs it in the background.
+    async_result = celery_app.send_task("tasks.slow_job", args=[body.seconds])
+    return {"job_id": async_result.id, "status": "queued"}
+
+
+@app.get("/jobs/{job_id}")
+def get_job(job_id: str):
+    # Look the job up by id in the result backend.
+    result = AsyncResult(job_id, app=celery_app)
+    response = {"job_id": job_id, "status": result.status}
+    if result.successful():
+        response["result"] = result.result
+    return response
