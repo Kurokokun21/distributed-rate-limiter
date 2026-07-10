@@ -3,10 +3,11 @@ import time
 from pathlib import Path
 
 import redis
+import redis.asyncio as aioredis
 from celery import Celery
 from celery.result import AsyncResult
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 app = FastAPI(title="distributed-rate-limiter")
@@ -159,3 +160,81 @@ def get_job(job_id: str):
     if result.successful():
         response["result"] = result.result
     return response
+
+
+# --- Phase 4: live push over WebSocket (no polling) ---
+
+@app.websocket("/ws/jobs/{job_id}")
+async def ws_job(websocket: WebSocket, job_id: str):
+    await websocket.accept()
+
+    # Open an async Redis connection and subscribe FIRST, so a result that
+    # lands while we're setting up isn't missed.
+    conn = aioredis.from_url(_redis_url, decode_responses=True)
+    pubsub = conn.pubsub()
+    await pubsub.subscribe(f"jobs:{job_id}")
+
+    try:
+        # Covers the job that already finished before the socket opened:
+        # its publish is long gone, so read the stored result directly.
+        result = AsyncResult(job_id, app=celery_app)
+        if result.ready():
+            await websocket.send_json(
+                {"job_id": job_id, "status": result.status, "result": result.result}
+            )
+            return
+
+        # Otherwise wait for the worker's "done" broadcast and forward it.
+        async for message in pubsub.listen():
+            if message["type"] == "message":
+                await websocket.send_text(message["data"])
+                return
+    except WebSocketDisconnect:
+        pass  # client closed the tab; nothing to do
+    finally:
+        await pubsub.unsubscribe(f"jobs:{job_id}")
+        await pubsub.aclose()
+        await conn.aclose()
+
+
+DEMO_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Job push demo</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 48px auto; padding: 0 20px; }
+  button { font-size: 1rem; padding: 10px 18px; cursor: pointer; }
+  #log { margin-top: 20px; padding: 16px; background: #111; color: #0f0;
+         font-family: monospace; font-size: .85rem; border-radius: 8px;
+         min-height: 160px; white-space: pre-wrap; }
+</style></head>
+<body>
+  <h1>Live job push</h1>
+  <p>Click to start a 5-second background job. The result is <b>pushed</b>
+     to this page over a WebSocket the instant it finishes &mdash; no polling.</p>
+  <button id="go">Start job</button>
+  <div id="log"></div>
+  <script>
+    const log = (m) => { document.getElementById('log').textContent +=
+      new Date().toLocaleTimeString() + '  ' + m + '\\n'; };
+    document.getElementById('go').onclick = async () => {
+      log('POST /jobs ...');
+      const res = await fetch('/jobs', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({seconds: 5}),
+      });
+      const {job_id} = await res.json();
+      log('queued, job_id = ' + job_id);
+
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      const ws = new WebSocket(proto + '://' + location.host + '/ws/jobs/' + job_id);
+      ws.onopen    = () => log('socket open, waiting for push...');
+      ws.onmessage = (e) => log('PUSHED: ' + e.data);
+      ws.onclose   = () => log('socket closed');
+    };
+  </script>
+</body></html>"""
+
+
+@app.get("/", response_class=HTMLResponse)
+def demo_page():
+    return DEMO_PAGE

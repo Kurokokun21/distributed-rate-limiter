@@ -1,3 +1,4 @@
+import json
 import os
 import time
 
@@ -31,11 +32,19 @@ celery_app.conf.beat_schedule = {
 _redis = redis.Redis(host=REDIS_HOST, port=int(REDIS_PORT), decode_responses=True)
 
 
-@celery_app.task(name="tasks.slow_job")
-def slow_job(n: int) -> dict:
+@celery_app.task(bind=True, name="tasks.slow_job")
+def slow_job(self, n: int) -> dict:
     """Pretend to do heavy work for `n` seconds, then return a result."""
     time.sleep(n)
-    return {"squared": n * n, "slept_for": n}
+    result = {"squared": n * n, "slept_for": n}
+
+    # Phase 4: announce completion on this job's Redis Pub/Sub channel.
+    # self.request.id is this task's id == the job_id the API handed the client.
+    _redis.publish(
+        f"jobs:{self.request.id}",
+        json.dumps({"job_id": self.request.id, "status": "SUCCESS", "result": result}),
+    )
+    return result
 
 
 @celery_app.task(name="tasks.heartbeat")
