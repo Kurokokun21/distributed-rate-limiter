@@ -109,5 +109,3 @@ loadtest/
   locustfile.py      two simulated user classes
 docker-compose.yml   the four services
 ```
-
-Phase-by-phase walkthrough with an interactive token-bucket demo and annotated code: see `roadmap.html`.
